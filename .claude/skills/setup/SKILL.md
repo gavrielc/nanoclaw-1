@@ -66,7 +66,7 @@ Run `bash setup.sh` and parse the status block.
 
 Run `npx tsx setup/index.ts --step environment` and parse the status block.
 
-- If HAS_AUTH=true → WhatsApp is already configured, note for step 5
+- If HAS_AUTH=true → WhatsApp is already configured, note for step 5 (channels)
 - If HAS_REGISTERED_GROUPS=true → note existing config, offer to skip or reconfigure
 - Record APPLE_CONTAINER and DOCKER values for step 3
 
@@ -122,19 +122,7 @@ AskUserQuestion: Claude subscription (Pro/Max) vs Anthropic API key?
 
 **API key:** Tell user to add `ANTHROPIC_API_KEY=<key>` to `.env`.
 
-## 5. Install Skills Marketplace
-
-Register and install the NanoClaw skills marketplace plugin so all feature skills (channel integrations, add-ons) are available:
-
-```bash
-claude plugin marketplace add qwibitai/nanoclaw-skills
-claude plugin marketplace update nanoclaw-skills
-claude plugin install nanoclaw-skills@nanoclaw-skills --scope project
-```
-
-The marketplace update ensures the local cache is fresh before installing. This is hot-loaded — no restart needed. All feature skills become immediately available.
-
-## 6. Set Up Channels
+## 5. Set Up Channels
 
 AskUserQuestion (multiSelect): Which messaging channels do you want to enable?
 - WhatsApp (authenticates via QR code or pairing code)
@@ -164,16 +152,16 @@ Each skill will:
 npm install && npm run build
 ```
 
-If the build fails, read the error output and fix it (usually a missing dependency). Then continue to step 7.
+If the build fails, read the error output and fix it (usually a missing dependency). Then continue.
 
-## 7. Mount Allowlist
+## 6. Mount Allowlist
 
 AskUserQuestion: Agent access to external directories?
 
 **No:** `npx tsx setup/index.ts --step mounts -- --empty`
 **Yes:** Collect paths/permissions. `npx tsx setup/index.ts --step mounts -- --json '{"allowedRoots":[...],"blockedPatterns":[],"nonMainReadOnly":true}'`
 
-## 8. Start Service
+## 7. Start Service
 
 If service already running: unload first.
 - macOS: `launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist`
@@ -203,7 +191,7 @@ Replace `USERNAME` with the actual username (from `whoami`). Run the two `sudo` 
 - Linux: check `systemctl --user status nanoclaw`.
 - Re-run the service step after fixing.
 
-## 9. Verify
+## 8. Verify
 
 Run `npx tsx setup/index.ts --step verify` and parse the status block.
 
