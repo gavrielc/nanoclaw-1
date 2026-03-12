@@ -95,9 +95,9 @@ sandbox_prep() {
   fi
   log "npm proxy configured"
 
-  # Fix CRLF from Windows host
+  # Fix CRLF from Windows host (temp file on same filesystem so mv is a rename)
   find "$PROJECT_ROOT" -maxdepth 2 -name "*.sh" -exec sh -c \
-    'tr -d "\r" < "$1" > /tmp/_fixcrlf && mv /tmp/_fixcrlf "$1" && chmod +x "$1"' _ {} \;
+    'tr -d "\r" < "$1" > "$1.tmp" && mv "$1.tmp" "$1" && chmod +x "$1"' _ {} \;
   log "CRLF fixed"
 }
 
