@@ -151,8 +151,8 @@ install_deps_virtiofs() {
   mkdir -p /tmp/npm-build
   cp package.json package-lock.json /tmp/npm-build/
 
-  # Install in /tmp where symlinks work
-  if (cd /tmp/npm-build && npm install --ignore-scripts >> "$LOG_FILE" 2>&1); then
+  # Install in /tmp where symlinks work (including native module builds)
+  if (cd /tmp/npm-build && npm install >> "$LOG_FILE" 2>&1); then
     log "npm install in /tmp succeeded"
   else
     log "npm install in /tmp failed"
@@ -162,14 +162,10 @@ install_deps_virtiofs() {
   # Add proxy packages needed by proxy-bootstrap.ts
   (cd /tmp/npm-build && npm install https-proxy-agent undici >> "$LOG_FILE" 2>&1) || true
 
-  # Tar-pipe node_modules back (much faster than cp -rL on virtiofs)
+  # Tar-pipe node_modules back — tolerate symlink errors (expected on virtiofs)
   rm -rf node_modules
-  (cd /tmp/npm-build && tar cf - node_modules) | tar xf -
+  (cd /tmp/npm-build && tar cf - node_modules) | tar xf - 2>>"$LOG_FILE" || true
   log "node_modules copied via tar"
-
-  # Rebuild native modules (better-sqlite3) in place on virtiofs
-  npm rebuild >> "$LOG_FILE" 2>&1 || true
-  log "Native modules rebuilt"
 
   # Create shell wrapper scripts for .bin/ (symlinks don't work on virtiofs)
   rm -rf node_modules/.bin
