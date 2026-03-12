@@ -1,4 +1,3 @@
-import { existsSync } from 'fs';
 import os from 'os';
 import path from 'path';
 
@@ -72,8 +71,3 @@ export const TRIGGER_PATTERN = new RegExp(
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
-
-// Detect Docker Sandbox environment (DinD microVM)
-export const IS_SANDBOX =
-  existsSync(path.join(os.homedir(), '.nanoclaw-workspace')) ||
-  (process.env.http_proxy?.includes('host.docker.internal') ?? false);
