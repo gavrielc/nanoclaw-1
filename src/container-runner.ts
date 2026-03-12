@@ -2,7 +2,7 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -14,6 +14,7 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
+  IS_SANDBOX,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
@@ -78,16 +79,10 @@ function buildVolumeMounts(
 
     // Shadow .env so the agent cannot read secrets from the mounted project root.
     // Credentials are injected by the credential proxy, never exposed to containers.
-    // Use an empty file instead of /dev/null (Docker may reject /dev/null mounts in sandboxes).
     const envFile = path.join(projectRoot, '.env');
     if (fs.existsSync(envFile)) {
-      const emptyEnv = path.join(DATA_DIR, 'empty-env');
-      if (!fs.existsSync(emptyEnv)) {
-        fs.mkdirSync(path.dirname(emptyEnv), { recursive: true });
-        fs.writeFileSync(emptyEnv, '');
-      }
       mounts.push({
-        hostPath: emptyEnv,
+        hostPath: '/dev/null',
         containerPath: '/workspace/project/.env',
         readonly: true,
       });
@@ -227,55 +222,6 @@ function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Forward proxy and CA settings so containers can reach external services
-  const caCertEnvVars = [
-    'NODE_EXTRA_CA_CERTS',
-    'SSL_CERT_FILE',
-    'REQUESTS_CA_BUNDLE',
-  ];
-  for (const envVar of [
-    'HTTP_PROXY',
-    'HTTPS_PROXY',
-    'NO_PROXY',
-    'http_proxy',
-    'https_proxy',
-    'no_proxy',
-    ...caCertEnvVars,
-  ]) {
-    if (process.env[envVar]) {
-      if (caCertEnvVars.includes(envVar)) {
-        args.push('-e', `${envVar}=/workspace/ca-cert/proxy-ca.crt`);
-      } else if (envVar === 'NO_PROXY' || envVar === 'no_proxy') {
-        // Add host.docker.internal to NO_PROXY so the credential proxy
-        // (ANTHROPIC_BASE_URL) isn't routed through the HTTPS proxy
-        const val = process.env[envVar];
-        const extra = val
-          ? `${val},host.docker.internal`
-          : 'host.docker.internal';
-        args.push('-e', `${envVar}=${extra}`);
-      } else {
-        args.push('-e', `${envVar}=${process.env[envVar]}`);
-      }
-    }
-  }
-
-  // Mount CA certificate into container if NODE_EXTRA_CA_CERTS is set.
-  // Docker may reject mounts from restricted host paths, so we copy the cert
-  // into the project's data directory and mount from there.
-  const hostCaCert =
-    process.env.NODE_EXTRA_CA_CERTS || process.env.SSL_CERT_FILE;
-  if (hostCaCert && fs.existsSync(hostCaCert)) {
-    const caCertDir = path.join(DATA_DIR, 'ca-cert');
-    const caCertDst = path.join(caCertDir, 'proxy-ca.crt');
-    fs.mkdirSync(caCertDir, { recursive: true });
-    fs.copyFileSync(hostCaCert, caCertDst);
-    mounts.push({
-      hostPath: caCertDir,
-      containerPath: '/workspace/ca-cert',
-      readonly: true,
-    });
-  }
-
   // Route API traffic through the credential proxy (containers never see real secrets)
   args.push(
     '-e',
@@ -319,12 +265,355 @@ function buildContainerArgs(
   return args;
 }
 
+/**
+ * Sandbox container runner: DinD can't bind-mount virtiofs paths.
+ * Uses tmpfs mounts + tar pipe for data transfer instead.
+ * Strategy: docker run -d --entrypoint sleep (background) → tar copy-in →
+ * docker exec /app/entrypoint.sh (run agent) → tar copy-out → docker rm -f
+ */
+async function sandboxRunContainerAgent(
+  group: RegisteredGroup,
+  input: ContainerInput,
+  onProcess: (proc: ChildProcess, containerName: string) => void,
+  onOutput?: (output: ContainerOutput) => Promise<void>,
+): Promise<ContainerOutput> {
+  const startTime = Date.now();
+  const groupDir = resolveGroupFolderPath(group.folder);
+  fs.mkdirSync(groupDir, { recursive: true });
+
+  const allMounts = buildVolumeMounts(group, input.isMain);
+  const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
+  const containerName = `nanoclaw-${safeName}-${Date.now()}`;
+
+  // Filter mounts for sandbox: skip project root (too large for tar copy),
+  // .env shadow, and file-based mounts (tmpfs is directory-only)
+  const sandboxMounts = allMounts.filter((m) => {
+    if (m.containerPath === '/workspace/project') return false;
+    if (m.containerPath === '/workspace/project/.env') return false;
+    if (!fs.existsSync(m.hostPath)) return false;
+    try {
+      return fs.statSync(m.hostPath).isDirectory();
+    } catch {
+      return false;
+    }
+  });
+
+  const logsDir = path.join(groupDir, 'logs');
+  fs.mkdirSync(logsDir, { recursive: true });
+
+  logger.info(
+    {
+      group: group.name,
+      containerName,
+      mountCount: sandboxMounts.length,
+      isMain: input.isMain,
+    },
+    'Spawning sandbox container agent',
+  );
+
+  // Build tmpfs args for each mount point
+  const tmpfsArgs: string[] = [];
+  for (const m of sandboxMounts) {
+    tmpfsArgs.push('--tmpfs', `${m.containerPath}:uid=1000,gid=1000`);
+  }
+  // Main still needs a project mount point (empty, path must exist for CLAUDE.md loading)
+  if (input.isMain) {
+    tmpfsArgs.push('--tmpfs', '/workspace/project:uid=1000,gid=1000');
+  }
+
+  // Build env args
+  const envArgs: string[] = [];
+  envArgs.push('-e', `TZ=${TIMEZONE}`);
+  envArgs.push(
+    '-e',
+    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+  );
+
+  const authMode = detectAuthMode();
+  if (authMode === 'api-key') {
+    envArgs.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+  } else {
+    envArgs.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // Forward proxy env vars for sandbox MITM proxy
+  for (const pv of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) {
+    if (process.env[pv]) envArgs.push('-e', `${pv}=${process.env[pv]}`);
+  }
+
+  // NO_PROXY must include host.docker.internal (credential proxy is HTTP, not through HTTPS proxy)
+  const noProxyParts = [process.env.NO_PROXY, 'host.docker.internal'].filter(
+    Boolean,
+  );
+  const noProxy = noProxyParts.join(',');
+  envArgs.push('-e', `NO_PROXY=${noProxy}`, '-e', `no_proxy=${noProxy}`);
+
+  // Single-turn mode: agent exits after first query (IPC doesn't work with tmpfs)
+  envArgs.push('-e', 'NANOCLAW_SINGLE_TURN=1');
+
+  // SSL certs for proxy
+  if (process.env.SSL_CERT_FILE) {
+    envArgs.push(
+      '-e',
+      'SSL_CERT_FILE=/workspace/proxy-ca.crt',
+      '-e',
+      'NODE_EXTRA_CA_CERTS=/workspace/proxy-ca.crt',
+    );
+  }
+
+  // 1. Start background container with tmpfs mounts
+  const runArgs = [
+    'run',
+    '-d',
+    '--name',
+    containerName,
+    '--entrypoint',
+    'sleep',
+    ...hostGatewayArgs(),
+    ...tmpfsArgs,
+    ...envArgs,
+    CONTAINER_IMAGE,
+    'infinity',
+  ];
+
+  try {
+    execFileSync(CONTAINER_RUNTIME_BIN, runArgs, { stdio: 'pipe' });
+  } catch (err) {
+    logger.error({ err, containerName }, 'Failed to create sandbox container');
+    return {
+      status: 'error',
+      result: null,
+      error: `Failed to create sandbox container: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  // 2. Copy data into container via tar pipe
+  for (const m of sandboxMounts) {
+    try {
+      execFileSync(
+        'bash',
+        [
+          '-c',
+          `tar -cf - -C '${m.hostPath}' . | ${CONTAINER_RUNTIME_BIN} exec -i -u node ${containerName} tar --no-same-owner -xf - -C '${m.containerPath}'`,
+        ],
+        { stdio: 'pipe', timeout: 30000 },
+      );
+    } catch (err) {
+      logger.warn(
+        { mount: m.containerPath, err },
+        'Sandbox tar copy-in failed',
+      );
+    }
+  }
+
+  // Copy proxy CA cert if available
+  const projectRoot = process.cwd();
+  const caCertPath = path.join(projectRoot, 'proxy-ca.crt');
+  if (fs.existsSync(caCertPath)) {
+    try {
+      execFileSync(
+        'bash',
+        [
+          '-c',
+          `tar -cf - -C '${projectRoot}' proxy-ca.crt | ${CONTAINER_RUNTIME_BIN} exec -i -u node ${containerName} tar --no-same-owner -xf - -C /workspace`,
+        ],
+        { stdio: 'pipe' },
+      );
+    } catch {
+      /* non-critical */
+    }
+  }
+
+  // 3. Run agent via docker exec
+  return new Promise((resolve) => {
+    const container = spawn(
+      CONTAINER_RUNTIME_BIN,
+      ['exec', '-i', containerName, '/app/entrypoint.sh'],
+      { stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+
+    onProcess(container, containerName);
+
+    container.stdin.write(JSON.stringify(input));
+    container.stdin.end();
+
+    let stdout = '';
+    let stderr = '';
+    let hadStreamingOutput = false;
+    let newSessionId: string | undefined;
+    let outputChain = Promise.resolve();
+    let parseBuffer = '';
+    let copiedOut = false;
+    let killTimer: ReturnType<typeof setTimeout> | null = null;
+
+    // Copy writable data out of container (idempotent, safe to call multiple times)
+    const doCopyOut = () => {
+      if (copiedOut) return;
+      copiedOut = true;
+      for (const m of sandboxMounts) {
+        if (m.readonly) continue;
+        try {
+          execFileSync(
+            'bash',
+            [
+              '-c',
+              `${CONTAINER_RUNTIME_BIN} exec ${containerName} tar -cf - -C '${m.containerPath}' . 2>/dev/null | tar --no-same-owner -xf - -C '${m.hostPath}'`,
+            ],
+            { stdio: 'pipe', timeout: 30000 },
+          );
+        } catch {
+          /* container may be dead */
+        }
+      }
+    };
+
+    container.stdout.on('data', (data) => {
+      const chunk = data.toString();
+      stdout += chunk;
+
+      if (onOutput) {
+        parseBuffer += chunk;
+        let startIdx: number;
+        while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
+          const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
+          if (endIdx === -1) break;
+          const jsonStr = parseBuffer
+            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
+            .trim();
+          parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
+          try {
+            const parsed: ContainerOutput = JSON.parse(jsonStr);
+            if (parsed.newSessionId) newSessionId = parsed.newSessionId;
+            hadStreamingOutput = true;
+            outputChain = outputChain.then(() => onOutput(parsed));
+            // Kill timer: after first real output, wait then force-stop
+            // (Claude SDK subprocesses may not exit cleanly after process.exit)
+            if (parsed.result && !killTimer) {
+              killTimer = setTimeout(() => {
+                logger.info(
+                  { containerName },
+                  'Sandbox kill timer: copying out and stopping container',
+                );
+                doCopyOut();
+                try {
+                  execFileSync(CONTAINER_RUNTIME_BIN, ['kill', containerName], {
+                    stdio: 'pipe',
+                  });
+                } catch {
+                  /* already dead */
+                }
+              }, 5000);
+            }
+          } catch (err) {
+            logger.warn({ err }, 'Failed to parse sandbox output');
+          }
+        }
+      }
+    });
+
+    container.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    container.on('close', (code) => {
+      if (killTimer) clearTimeout(killTimer);
+
+      // Copy writable data out (if not already done by kill timer)
+      doCopyOut();
+
+      // Remove container
+      try {
+        execFileSync(CONTAINER_RUNTIME_BIN, ['rm', '-f', containerName], {
+          stdio: 'pipe',
+        });
+      } catch {
+        /* already gone */
+      }
+
+      const duration = Date.now() - startTime;
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      fs.writeFileSync(
+        path.join(logsDir, `container-${timestamp}.log`),
+        [
+          `=== Sandbox Container Log ===`,
+          `Duration: ${duration}ms`,
+          `Exit: ${code}`,
+          `Group: ${group.name}`,
+          `Container: ${containerName}`,
+          `Streaming: ${hadStreamingOutput}`,
+          ``,
+          `=== Stderr (last 500) ===`,
+          stderr.slice(-500),
+          ``,
+          `=== Stdout (last 500) ===`,
+          stdout.slice(-500),
+        ].join('\n'),
+      );
+
+      if (hadStreamingOutput) {
+        outputChain.then(() =>
+          resolve({ status: 'success', result: null, newSessionId }),
+        );
+        return;
+      }
+
+      if (code !== 0) {
+        resolve({
+          status: 'error',
+          result: null,
+          error: `Sandbox container exited ${code}: ${stderr.slice(-200)}`,
+        });
+        return;
+      }
+
+      // Try parse output from stdout
+      const si = stdout.indexOf(OUTPUT_START_MARKER);
+      const ei = stdout.indexOf(OUTPUT_END_MARKER);
+      if (si !== -1 && ei !== -1 && ei > si) {
+        try {
+          resolve(
+            JSON.parse(
+              stdout.slice(si + OUTPUT_START_MARKER.length, ei).trim(),
+            ),
+          );
+          return;
+        } catch {
+          /* fall through */
+        }
+      }
+
+      resolve({ status: 'success', result: null, newSessionId });
+    });
+
+    container.on('error', (err) => {
+      if (killTimer) clearTimeout(killTimer);
+      try {
+        execFileSync(CONTAINER_RUNTIME_BIN, ['rm', '-f', containerName], {
+          stdio: 'pipe',
+        });
+      } catch {
+        /* ignore */
+      }
+      resolve({
+        status: 'error',
+        result: null,
+        error: `Sandbox spawn error: ${err.message}`,
+      });
+    });
+  });
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
+  // Sandbox mode: DinD can't bind-mount, use tmpfs + tar pipe approach
+  if (IS_SANDBOX) {
+    return sandboxRunContainerAgent(group, input, onProcess, onOutput);
+  }
+
   const startTime = Date.now();
 
   const groupDir = resolveGroupFolderPath(group.folder);
