@@ -1,9 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-# setup.sh — Bootstrap script for NanoClaw
+# setup.sh — Bootstrap script for NanoClaw (sandbox fork)
 # Handles Node.js/npm setup, then hands off to the Node.js setup modules.
-# This is the only bash script in the setup flow.
+# On virtiofs (Docker Desktop sandbox), also handles build tools, proxy
+# config, CRLF fixes, and the symlink workaround for npm install.
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="$PROJECT_ROOT/logs/setup.log"
@@ -35,7 +36,14 @@ detect_platform() {
     IS_ROOT="true"
   fi
 
-  log "Platform: $PLATFORM, WSL: $IS_WSL, Root: $IS_ROOT"
+  # Test if filesystem supports symlinks (virtiofs on Windows doesn't)
+  NO_SYMLINKS="false"
+  if ! ln -s /dev/null "$PROJECT_ROOT/.symlink_test" 2>/dev/null; then
+    NO_SYMLINKS="true"
+  fi
+  rm -f "$PROJECT_ROOT/.symlink_test" 2>/dev/null
+
+  log "Platform: $PLATFORM, WSL: $IS_WSL, Root: $IS_ROOT, NoSymlinks: $NO_SYMLINKS"
 }
 
 # --- Node.js check ---
@@ -59,6 +67,40 @@ check_node() {
   fi
 }
 
+# --- Sandbox prep (build tools, proxy config, CRLF) ---
+
+sandbox_prep() {
+  if [ "$NO_SYMLINKS" = "false" ]; then
+    return
+  fi
+
+  log "No symlink support — running sandbox prep"
+
+  # Install build tools for native modules (better-sqlite3)
+  if ! command -v gcc >/dev/null 2>&1; then
+    log "Installing build-essential..."
+    sudo apt-get update -qq >/dev/null 2>&1
+    sudo apt-get install -y -qq build-essential python3 >/dev/null 2>&1
+    log "Build tools installed"
+  fi
+
+  # Configure npm for MITM proxy (only when proxy is present)
+  if [ -n "${http_proxy:-}" ]; then
+    npm config set strict-ssl false 2>/dev/null
+    npm config set proxy "$http_proxy"
+    npm config set https-proxy "$http_proxy"
+  fi
+  if [ -f /usr/local/share/ca-certificates/proxy-ca.crt ]; then
+    npm config set cafile /usr/local/share/ca-certificates/proxy-ca.crt
+  fi
+  log "npm proxy configured"
+
+  # Fix CRLF from Windows host (temp file on same filesystem so mv is a rename)
+  find "$PROJECT_ROOT" -maxdepth 2 -name "*.sh" -exec sh -c \
+    'tr -d "\r" < "$1" > "$1.tmp" && mv "$1.tmp" "$1" && chmod +x "$1"' _ {} \;
+  log "CRLF fixed"
+}
+
 # --- npm install ---
 
 install_deps() {
@@ -72,7 +114,15 @@ install_deps() {
 
   cd "$PROJECT_ROOT"
 
-  # npm install with --unsafe-perm if root (needed for native modules)
+  if [ "$NO_SYMLINKS" = "true" ]; then
+    install_deps_virtiofs
+  else
+    install_deps_normal
+  fi
+}
+
+# Standard npm install (macOS, Linux, WSL)
+install_deps_normal() {
   local npm_flags=""
   if [ "$IS_ROOT" = "true" ]; then
     npm_flags="--unsafe-perm"
@@ -88,7 +138,57 @@ install_deps() {
     return
   fi
 
-  # Verify native module (better-sqlite3)
+  verify_native_modules
+}
+
+# VirtioFS workaround: install in /tmp (ext4), tar-pipe back.
+# virtiofs doesn't support symlinks, which breaks npm install, node-gyp,
+# and the .bin/ directory. We install in /tmp where symlinks work,
+# then tar-pipe node_modules back and create shell wrapper scripts for .bin/.
+install_deps_virtiofs() {
+  log "VirtioFS: installing deps in /tmp to work around symlink limitation"
+
+  mkdir -p /tmp/npm-build
+  cp package.json package-lock.json /tmp/npm-build/
+
+  # Install in /tmp where symlinks work (including native module builds)
+  if (cd /tmp/npm-build && npm install >> "$LOG_FILE" 2>&1); then
+    log "npm install in /tmp succeeded"
+  else
+    log "npm install in /tmp failed"
+    return
+  fi
+
+  # Add proxy packages needed by proxy-bootstrap.ts
+  (cd /tmp/npm-build && npm install https-proxy-agent undici >> "$LOG_FILE" 2>&1) || true
+
+  # Tar-pipe node_modules back — tolerate symlink errors (expected on virtiofs)
+  rm -rf node_modules
+  (cd /tmp/npm-build && tar cf - node_modules) | tar xf - 2>>"$LOG_FILE" || true
+  log "node_modules copied via tar"
+
+  # Create shell wrapper scripts for .bin/ (symlinks don't work on virtiofs)
+  rm -rf node_modules/.bin
+  mkdir -p node_modules/.bin
+  if [ -d /tmp/npm-build/node_modules/.bin ]; then
+    (cd /tmp/npm-build/node_modules/.bin && for f in *; do
+      if [ -L "$f" ]; then
+        target=$(readlink "$f")
+        cat > "${PROJECT_ROOT}/node_modules/.bin/$f" << WRAPPER
+#!/bin/sh
+exec "${PROJECT_ROOT}/node_modules/.bin/${target}" "\$@"
+WRAPPER
+        chmod +x "${PROJECT_ROOT}/node_modules/.bin/$f"
+      fi
+    done)
+  fi
+  log ".bin/ wrappers created"
+
+  DEPS_OK="true"
+  verify_native_modules
+}
+
+verify_native_modules() {
   log "Verifying native modules"
   if node -e "require('better-sqlite3')" >> "$LOG_FILE" 2>&1; then
     NATIVE_OK="true"
@@ -122,6 +222,7 @@ log "=== Bootstrap started ==="
 
 detect_platform
 check_node
+sandbox_prep
 install_deps
 check_build_tools
 
@@ -140,6 +241,7 @@ cat <<EOF
 PLATFORM: $PLATFORM
 IS_WSL: $IS_WSL
 IS_ROOT: $IS_ROOT
+NO_SYMLINKS: $NO_SYMLINKS
 NODE_VERSION: $NODE_VERSION
 NODE_OK: $NODE_OK
 NODE_PATH: ${NODE_PATH_FOUND:-not_found}

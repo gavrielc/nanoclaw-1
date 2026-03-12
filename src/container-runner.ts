@@ -2,7 +2,7 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -78,16 +78,10 @@ function buildVolumeMounts(
 
     // Shadow .env so the agent cannot read secrets from the mounted project root.
     // Credentials are injected by the credential proxy, never exposed to containers.
-    // Use an empty file instead of /dev/null (Docker may reject /dev/null mounts in sandboxes).
     const envFile = path.join(projectRoot, '.env');
     if (fs.existsSync(envFile)) {
-      const emptyEnv = path.join(DATA_DIR, 'empty-env');
-      if (!fs.existsSync(emptyEnv)) {
-        fs.mkdirSync(path.dirname(emptyEnv), { recursive: true });
-        fs.writeFileSync(emptyEnv, '');
-      }
       mounts.push({
-        hostPath: emptyEnv,
+        hostPath: '/dev/null',
         containerPath: '/workspace/project/.env',
         readonly: true,
       });
@@ -227,55 +221,6 @@ function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Forward proxy and CA settings so containers can reach external services
-  const caCertEnvVars = [
-    'NODE_EXTRA_CA_CERTS',
-    'SSL_CERT_FILE',
-    'REQUESTS_CA_BUNDLE',
-  ];
-  for (const envVar of [
-    'HTTP_PROXY',
-    'HTTPS_PROXY',
-    'NO_PROXY',
-    'http_proxy',
-    'https_proxy',
-    'no_proxy',
-    ...caCertEnvVars,
-  ]) {
-    if (process.env[envVar]) {
-      if (caCertEnvVars.includes(envVar)) {
-        args.push('-e', `${envVar}=/workspace/ca-cert/proxy-ca.crt`);
-      } else if (envVar === 'NO_PROXY' || envVar === 'no_proxy') {
-        // Add host.docker.internal to NO_PROXY so the credential proxy
-        // (ANTHROPIC_BASE_URL) isn't routed through the HTTPS proxy
-        const val = process.env[envVar];
-        const extra = val
-          ? `${val},host.docker.internal`
-          : 'host.docker.internal';
-        args.push('-e', `${envVar}=${extra}`);
-      } else {
-        args.push('-e', `${envVar}=${process.env[envVar]}`);
-      }
-    }
-  }
-
-  // Mount CA certificate into container if NODE_EXTRA_CA_CERTS is set.
-  // Docker may reject mounts from restricted host paths, so we copy the cert
-  // into the project's data directory and mount from there.
-  const hostCaCert =
-    process.env.NODE_EXTRA_CA_CERTS || process.env.SSL_CERT_FILE;
-  if (hostCaCert && fs.existsSync(hostCaCert)) {
-    const caCertDir = path.join(DATA_DIR, 'ca-cert');
-    const caCertDst = path.join(caCertDir, 'proxy-ca.crt');
-    fs.mkdirSync(caCertDir, { recursive: true });
-    fs.copyFileSync(hostCaCert, caCertDst);
-    mounts.push({
-      hostPath: caCertDir,
-      containerPath: '/workspace/ca-cert',
-      readonly: true,
-    });
-  }
-
   // Route API traffic through the credential proxy (containers never see real secrets)
   args.push(
     '-e',
@@ -319,382 +264,352 @@ function buildContainerArgs(
   return args;
 }
 
-export async function runContainerAgent(
+/**
+ * Sandbox container runner: DinD can't bind-mount virtiofs paths.
+ * Uses tmpfs mounts + tar pipe for data transfer instead.
+ * Strategy: docker run -d --entrypoint sleep (background) → tar copy-in →
+ * docker exec /app/entrypoint.sh (run agent) → tar copy-out → docker rm -f
+ */
+async function sandboxRunContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
-
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  const allMounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
 
-  logger.debug(
-    {
-      group: group.name,
-      containerName,
-      mounts: mounts.map(
-        (m) =>
-          `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
-      ),
-      containerArgs: containerArgs.join(' '),
-    },
-    'Container mount configuration',
-  );
+  // Filter mounts for sandbox: skip project root (too large for tar copy),
+  // .env shadow, and file-based mounts (tmpfs is directory-only)
+  const sandboxMounts = allMounts.filter((m) => {
+    if (m.containerPath === '/workspace/project') return false;
+    if (m.containerPath === '/workspace/project/.env') return false;
+    if (!fs.existsSync(m.hostPath)) return false;
+    try {
+      return fs.statSync(m.hostPath).isDirectory();
+    } catch {
+      return false;
+    }
+  });
+
+  const logsDir = path.join(groupDir, 'logs');
+  fs.mkdirSync(logsDir, { recursive: true });
 
   logger.info(
     {
       group: group.name,
       containerName,
-      mountCount: mounts.length,
+      mountCount: sandboxMounts.length,
       isMain: input.isMain,
     },
-    'Spawning container agent',
+    'Spawning sandbox container agent',
   );
 
-  const logsDir = path.join(groupDir, 'logs');
-  fs.mkdirSync(logsDir, { recursive: true });
+  // Build tmpfs args for each mount point
+  const tmpfsArgs: string[] = [];
+  for (const m of sandboxMounts) {
+    tmpfsArgs.push('--tmpfs', `${m.containerPath}:uid=1000,gid=1000`);
+  }
+  // Main still needs a project mount point (empty, path must exist for CLAUDE.md loading)
+  if (input.isMain) {
+    tmpfsArgs.push('--tmpfs', '/workspace/project:uid=1000,gid=1000');
+  }
 
+  // Build env args
+  const envArgs: string[] = [];
+  envArgs.push('-e', `TZ=${TIMEZONE}`);
+  envArgs.push(
+    '-e',
+    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+  );
+
+  const authMode = detectAuthMode();
+  if (authMode === 'api-key') {
+    envArgs.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+  } else {
+    envArgs.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // Forward proxy env vars for sandbox MITM proxy
+  for (const pv of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) {
+    if (process.env[pv]) envArgs.push('-e', `${pv}=${process.env[pv]}`);
+  }
+
+  // NO_PROXY must include host.docker.internal (credential proxy is HTTP, not through HTTPS proxy)
+  const noProxyParts = [process.env.NO_PROXY, 'host.docker.internal'].filter(
+    Boolean,
+  );
+  const noProxy = noProxyParts.join(',');
+  envArgs.push('-e', `NO_PROXY=${noProxy}`, '-e', `no_proxy=${noProxy}`);
+
+  // Single-turn mode: agent exits after first query (IPC doesn't work with tmpfs)
+  envArgs.push('-e', 'NANOCLAW_SINGLE_TURN=1');
+
+  // SSL certs for proxy
+  if (process.env.SSL_CERT_FILE) {
+    envArgs.push(
+      '-e',
+      'SSL_CERT_FILE=/workspace/proxy-ca.crt',
+      '-e',
+      'NODE_EXTRA_CA_CERTS=/workspace/proxy-ca.crt',
+    );
+  }
+
+  // 1. Start background container with tmpfs mounts
+  const runArgs = [
+    'run',
+    '-d',
+    '--name',
+    containerName,
+    '--entrypoint',
+    'sleep',
+    ...hostGatewayArgs(),
+    ...tmpfsArgs,
+    ...envArgs,
+    CONTAINER_IMAGE,
+    'infinity',
+  ];
+
+  try {
+    execFileSync(CONTAINER_RUNTIME_BIN, runArgs, { stdio: 'pipe' });
+  } catch (err) {
+    logger.error({ err, containerName }, 'Failed to create sandbox container');
+    return {
+      status: 'error',
+      result: null,
+      error: `Failed to create sandbox container: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  // 2. Copy data into container via tar pipe
+  for (const m of sandboxMounts) {
+    try {
+      execFileSync(
+        'bash',
+        [
+          '-c',
+          `tar -cf - -C '${m.hostPath}' . | ${CONTAINER_RUNTIME_BIN} exec -i -u node ${containerName} tar --no-same-owner -xf - -C '${m.containerPath}'`,
+        ],
+        { stdio: 'pipe', timeout: 30000 },
+      );
+    } catch (err) {
+      logger.warn(
+        { mount: m.containerPath, err },
+        'Sandbox tar copy-in failed',
+      );
+    }
+  }
+
+  // Copy proxy CA cert if available
+  const projectRoot = process.cwd();
+  const caCertPath = path.join(projectRoot, 'proxy-ca.crt');
+  if (fs.existsSync(caCertPath)) {
+    try {
+      execFileSync(
+        'bash',
+        [
+          '-c',
+          `tar -cf - -C '${projectRoot}' proxy-ca.crt | ${CONTAINER_RUNTIME_BIN} exec -i -u node ${containerName} tar --no-same-owner -xf - -C /workspace`,
+        ],
+        { stdio: 'pipe' },
+      );
+    } catch {
+      /* non-critical */
+    }
+  }
+
+  // 3. Run agent via docker exec
   return new Promise((resolve) => {
-    const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    const container = spawn(
+      CONTAINER_RUNTIME_BIN,
+      ['exec', '-i', containerName, '/app/entrypoint.sh'],
+      { stdio: ['pipe', 'pipe', 'pipe'] },
+    );
 
     onProcess(container, containerName);
-
-    let stdout = '';
-    let stderr = '';
-    let stdoutTruncated = false;
-    let stderrTruncated = false;
 
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
 
-    // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
-    let parseBuffer = '';
+    let stdout = '';
+    let stderr = '';
+    let hadStreamingOutput = false;
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
+    let parseBuffer = '';
+    let copiedOut = false;
+    let killTimer: ReturnType<typeof setTimeout> | null = null;
+
+    // Copy writable data out of container (idempotent, safe to call multiple times)
+    const doCopyOut = () => {
+      if (copiedOut) return;
+      copiedOut = true;
+      for (const m of sandboxMounts) {
+        if (m.readonly) continue;
+        try {
+          execFileSync(
+            'bash',
+            [
+              '-c',
+              `${CONTAINER_RUNTIME_BIN} exec ${containerName} tar -cf - -C '${m.containerPath}' . 2>/dev/null | tar --no-same-owner -xf - -C '${m.hostPath}'`,
+            ],
+            { stdio: 'pipe', timeout: 30000 },
+          );
+        } catch {
+          /* container may be dead */
+        }
+      }
+    };
 
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
+      stdout += chunk;
 
-      // Always accumulate for logging
-      if (!stdoutTruncated) {
-        const remaining = CONTAINER_MAX_OUTPUT_SIZE - stdout.length;
-        if (chunk.length > remaining) {
-          stdout += chunk.slice(0, remaining);
-          stdoutTruncated = true;
-          logger.warn(
-            { group: group.name, size: stdout.length },
-            'Container stdout truncated due to size limit',
-          );
-        } else {
-          stdout += chunk;
-        }
-      }
-
-      // Stream-parse for output markers
       if (onOutput) {
         parseBuffer += chunk;
         let startIdx: number;
         while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
           const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
-          if (endIdx === -1) break; // Incomplete pair, wait for more data
-
+          if (endIdx === -1) break;
           const jsonStr = parseBuffer
             .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
             .trim();
           parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
-
           try {
             const parsed: ContainerOutput = JSON.parse(jsonStr);
-            if (parsed.newSessionId) {
-              newSessionId = parsed.newSessionId;
-            }
+            if (parsed.newSessionId) newSessionId = parsed.newSessionId;
             hadStreamingOutput = true;
-            // Activity detected — reset the hard timeout
-            resetTimeout();
-            // Call onOutput for all markers (including null results)
-            // so idle timers start even for "silent" query completions.
             outputChain = outputChain.then(() => onOutput(parsed));
+            // Kill timer: after first real output, wait then force-stop
+            // (Claude SDK subprocesses may not exit cleanly after process.exit)
+            if (parsed.result && !killTimer) {
+              killTimer = setTimeout(() => {
+                logger.info(
+                  { containerName },
+                  'Sandbox kill timer: copying out and stopping container',
+                );
+                doCopyOut();
+                try {
+                  execFileSync(CONTAINER_RUNTIME_BIN, ['kill', containerName], {
+                    stdio: 'pipe',
+                  });
+                } catch {
+                  /* already dead */
+                }
+              }, 5000);
+            }
           } catch (err) {
-            logger.warn(
-              { group: group.name, error: err },
-              'Failed to parse streamed output chunk',
-            );
+            logger.warn({ err }, 'Failed to parse sandbox output');
           }
         }
       }
     });
 
     container.stderr.on('data', (data) => {
-      const chunk = data.toString();
-      const lines = chunk.trim().split('\n');
-      for (const line of lines) {
-        if (line) logger.debug({ container: group.folder }, line);
-      }
-      // Don't reset timeout on stderr — SDK writes debug logs continuously.
-      // Timeout only resets on actual output (OUTPUT_MARKER in stdout).
-      if (stderrTruncated) return;
-      const remaining = CONTAINER_MAX_OUTPUT_SIZE - stderr.length;
-      if (chunk.length > remaining) {
-        stderr += chunk.slice(0, remaining);
-        stderrTruncated = true;
-        logger.warn(
-          { group: group.name, size: stderr.length },
-          'Container stderr truncated due to size limit',
-        );
-      } else {
-        stderr += chunk;
-      }
+      stderr += data.toString();
     });
 
-    let timedOut = false;
-    let hadStreamingOutput = false;
-    const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
-    // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
-    // graceful _close sentinel has time to trigger before the hard kill fires.
-    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
-
-    const killOnTimeout = () => {
-      timedOut = true;
-      logger.error(
-        { group: group.name, containerName },
-        'Container timeout, stopping gracefully',
-      );
-      exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
-        if (err) {
-          logger.warn(
-            { group: group.name, containerName, err },
-            'Graceful stop failed, force killing',
-          );
-          container.kill('SIGKILL');
-        }
-      });
-    };
-
-    let timeout = setTimeout(killOnTimeout, timeoutMs);
-
-    // Reset the timeout whenever there's activity (streaming output)
-    const resetTimeout = () => {
-      clearTimeout(timeout);
-      timeout = setTimeout(killOnTimeout, timeoutMs);
-    };
-
     container.on('close', (code) => {
-      clearTimeout(timeout);
-      const duration = Date.now() - startTime;
+      if (killTimer) clearTimeout(killTimer);
 
-      if (timedOut) {
-        const ts = new Date().toISOString().replace(/[:.]/g, '-');
-        const timeoutLog = path.join(logsDir, `container-${ts}.log`);
-        fs.writeFileSync(
-          timeoutLog,
-          [
-            `=== Container Run Log (TIMEOUT) ===`,
-            `Timestamp: ${new Date().toISOString()}`,
-            `Group: ${group.name}`,
-            `Container: ${containerName}`,
-            `Duration: ${duration}ms`,
-            `Exit Code: ${code}`,
-            `Had Streaming Output: ${hadStreamingOutput}`,
-          ].join('\n'),
-        );
+      // Copy writable data out (if not already done by kill timer)
+      doCopyOut();
 
-        // Timeout after output = idle cleanup, not failure.
-        // The agent already sent its response; this is just the
-        // container being reaped after the idle period expired.
-        if (hadStreamingOutput) {
-          logger.info(
-            { group: group.name, containerName, duration, code },
-            'Container timed out after output (idle cleanup)',
-          );
-          outputChain.then(() => {
-            resolve({
-              status: 'success',
-              result: null,
-              newSessionId,
-            });
-          });
-          return;
-        }
-
-        logger.error(
-          { group: group.name, containerName, duration, code },
-          'Container timed out with no output',
-        );
-
-        resolve({
-          status: 'error',
-          result: null,
-          error: `Container timed out after ${configTimeout}ms`,
+      // Remove container
+      try {
+        execFileSync(CONTAINER_RUNTIME_BIN, ['rm', '-f', containerName], {
+          stdio: 'pipe',
         });
+      } catch {
+        /* already gone */
+      }
+
+      const duration = Date.now() - startTime;
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      fs.writeFileSync(
+        path.join(logsDir, `container-${timestamp}.log`),
+        [
+          `=== Sandbox Container Log ===`,
+          `Duration: ${duration}ms`,
+          `Exit: ${code}`,
+          `Group: ${group.name}`,
+          `Container: ${containerName}`,
+          `Streaming: ${hadStreamingOutput}`,
+          ``,
+          `=== Stderr (last 500) ===`,
+          stderr.slice(-500),
+          ``,
+          `=== Stdout (last 500) ===`,
+          stdout.slice(-500),
+        ].join('\n'),
+      );
+
+      if (hadStreamingOutput) {
+        outputChain.then(() =>
+          resolve({ status: 'success', result: null, newSessionId }),
+        );
         return;
       }
-
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const logFile = path.join(logsDir, `container-${timestamp}.log`);
-      const isVerbose =
-        process.env.LOG_LEVEL === 'debug' || process.env.LOG_LEVEL === 'trace';
-
-      const logLines = [
-        `=== Container Run Log ===`,
-        `Timestamp: ${new Date().toISOString()}`,
-        `Group: ${group.name}`,
-        `IsMain: ${input.isMain}`,
-        `Duration: ${duration}ms`,
-        `Exit Code: ${code}`,
-        `Stdout Truncated: ${stdoutTruncated}`,
-        `Stderr Truncated: ${stderrTruncated}`,
-        ``,
-      ];
-
-      const isError = code !== 0;
-
-      if (isVerbose || isError) {
-        logLines.push(
-          `=== Input ===`,
-          JSON.stringify(input, null, 2),
-          ``,
-          `=== Container Args ===`,
-          containerArgs.join(' '),
-          ``,
-          `=== Mounts ===`,
-          mounts
-            .map(
-              (m) =>
-                `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
-            )
-            .join('\n'),
-          ``,
-          `=== Stderr${stderrTruncated ? ' (TRUNCATED)' : ''} ===`,
-          stderr,
-          ``,
-          `=== Stdout${stdoutTruncated ? ' (TRUNCATED)' : ''} ===`,
-          stdout,
-        );
-      } else {
-        logLines.push(
-          `=== Input Summary ===`,
-          `Prompt length: ${input.prompt.length} chars`,
-          `Session ID: ${input.sessionId || 'new'}`,
-          ``,
-          `=== Mounts ===`,
-          mounts
-            .map((m) => `${m.containerPath}${m.readonly ? ' (ro)' : ''}`)
-            .join('\n'),
-          ``,
-        );
-      }
-
-      fs.writeFileSync(logFile, logLines.join('\n'));
-      logger.debug({ logFile, verbose: isVerbose }, 'Container log written');
 
       if (code !== 0) {
-        logger.error(
-          {
-            group: group.name,
-            code,
-            duration,
-            stderr,
-            stdout,
-            logFile,
-          },
-          'Container exited with error',
-        );
-
         resolve({
           status: 'error',
           result: null,
-          error: `Container exited with code ${code}: ${stderr.slice(-200)}`,
+          error: `Sandbox container exited ${code}: ${stderr.slice(-200)}`,
         });
         return;
       }
 
-      // Streaming mode: wait for output chain to settle, return completion marker
-      if (onOutput) {
-        outputChain.then(() => {
-          logger.info(
-            { group: group.name, duration, newSessionId },
-            'Container completed (streaming mode)',
+      // Try parse output from stdout
+      const si = stdout.indexOf(OUTPUT_START_MARKER);
+      const ei = stdout.indexOf(OUTPUT_END_MARKER);
+      if (si !== -1 && ei !== -1 && ei > si) {
+        try {
+          resolve(
+            JSON.parse(
+              stdout.slice(si + OUTPUT_START_MARKER.length, ei).trim(),
+            ),
           );
-          resolve({
-            status: 'success',
-            result: null,
-            newSessionId,
-          });
-        });
-        return;
-      }
-
-      // Legacy mode: parse the last output marker pair from accumulated stdout
-      try {
-        // Extract JSON between sentinel markers for robust parsing
-        const startIdx = stdout.indexOf(OUTPUT_START_MARKER);
-        const endIdx = stdout.indexOf(OUTPUT_END_MARKER);
-
-        let jsonLine: string;
-        if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-          jsonLine = stdout
-            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
-            .trim();
-        } else {
-          // Fallback: last non-empty line (backwards compatibility)
-          const lines = stdout.trim().split('\n');
-          jsonLine = lines[lines.length - 1];
+          return;
+        } catch {
+          /* fall through */
         }
-
-        const output: ContainerOutput = JSON.parse(jsonLine);
-
-        logger.info(
-          {
-            group: group.name,
-            duration,
-            status: output.status,
-            hasResult: !!output.result,
-          },
-          'Container completed',
-        );
-
-        resolve(output);
-      } catch (err) {
-        logger.error(
-          {
-            group: group.name,
-            stdout,
-            stderr,
-            error: err,
-          },
-          'Failed to parse container output',
-        );
-
-        resolve({
-          status: 'error',
-          result: null,
-          error: `Failed to parse container output: ${err instanceof Error ? err.message : String(err)}`,
-        });
       }
+
+      resolve({ status: 'success', result: null, newSessionId });
     });
 
     container.on('error', (err) => {
-      clearTimeout(timeout);
-      logger.error(
-        { group: group.name, containerName, error: err },
-        'Container spawn error',
-      );
+      if (killTimer) clearTimeout(killTimer);
+      try {
+        execFileSync(CONTAINER_RUNTIME_BIN, ['rm', '-f', containerName], {
+          stdio: 'pipe',
+        });
+      } catch {
+        /* ignore */
+      }
       resolve({
         status: 'error',
         result: null,
-        error: `Container spawn error: ${err.message}`,
+        error: `Sandbox spawn error: ${err.message}`,
       });
     });
   });
+}
+
+export async function runContainerAgent(
+  group: RegisteredGroup,
+  input: ContainerInput,
+  onProcess: (proc: ChildProcess, containerName: string) => void,
+  onOutput?: (output: ContainerOutput) => Promise<void>,
+): Promise<ContainerOutput> {
+  // Sandbox fork: always use tmpfs + tar pipe (DinD can't bind-mount)
+  return sandboxRunContainerAgent(group, input, onProcess, onOutput);
 }
 
 export function writeTasksSnapshot(

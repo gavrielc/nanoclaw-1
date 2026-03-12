@@ -1,3 +1,6 @@
+// Global proxy bootstrap — must be first import (before any HTTP calls)
+import './proxy-bootstrap.js';
+
 import fs from 'fs';
 import path from 'path';
 
