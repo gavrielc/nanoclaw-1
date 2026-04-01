@@ -1,11 +1,10 @@
 /**
- * Default voice handler — tries skill transcription, falls back to default.
+ * Default voice handler — no skill transcription installed.
+ * Returns null to let the default fallback handle it.
  *
- * Skill implementations listed here:
- *   - voice-openai: transcription via OpenAI Whisper API
+ * Skills can override this file on their branch to add transcription
+ * (e.g., voice-openai for OpenAI Whisper API).
  */
-import { transcribe } from './voice-openai.js';
-
-export async function handleVoice(filePath: string): Promise<any[] | null> {
-  return transcribe(filePath);
+export async function handleVoice(_filePath: string): Promise<any[] | null> {
+  return null;
 }

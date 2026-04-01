@@ -1,35 +1,36 @@
 ---
 name: add-pdf-reader
-description: Add PDF reading to NanoClaw agents. Extracts text from PDFs via pdftotext CLI. Handles attachments from any channel, URLs, and local files.
+description: Add PDF reading to NanoClaw agents. Extracts text from PDFs via pdftotext CLI. Handles WhatsApp attachments, URLs, and local files.
 ---
 
 # Add PDF Reader
 
-> **Credits:** Based on the upstream `skill-add-pdf-reader` branch by the NanoClaw community. PDF extraction approach informed by contributions from [@vsabavat](https://github.com/vsabavat) (#917, #1055) and [@JasonOA888](https://github.com/JasonOA888) (#902).
-
-Adds PDF reading to container agents via poppler-utils (`pdftotext`/`pdfinfo`). Two capabilities:
-
-- **Auto-extraction handler** (`container/handlers/pdf-extract.js`) — intercepts incoming PDF attachments via the media handler system. When a PDF is sent in any channel, the handler runs `pdftotext` and delivers extracted text to Claude instead of the raw file. Falls through to Claude's native PDF embedding if extraction fails.
-
-- **CLI tool** (`container/skills/pdf-reader/pdf-reader`) — on-demand PDF operations the agent can call via Bash: `extract`, `fetch` (download from URL), `info` (metadata), `list` (find all PDFs). Available regardless of whether auto-extraction is enabled.
+Adds PDF reading capability to all container agents using poppler-utils (pdftotext/pdfinfo). PDFs sent as WhatsApp attachments are auto-downloaded to the group workspace.
 
 ## Phase 1: Pre-flight
 
-Check if already applied:
+1. Check if `container/skills/pdf-reader/pdf-reader` exists — skip to Phase 3 if already applied
+2. Confirm WhatsApp is installed first (`skill/whatsapp` merged). This skill modifies WhatsApp channel files.
+
+## Phase 2: Apply Code Changes
+
+### Ensure WhatsApp fork remote
 
 ```bash
-test -f container/handlers/pdf-extract.js && echo "Already applied" || echo "Not applied"
+git remote -v
 ```
 
-If already applied, skip to Phase 3 (Verify).
+If `whatsapp` is missing, add it:
 
-## Phase 2: Apply
+```bash
+git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git
+```
 
 ### Merge the skill branch
 
 ```bash
-git fetch upstream skill/pdf-reader
-git merge upstream/skill/pdf-reader || {
+git fetch whatsapp skill/pdf-reader
+git merge whatsapp/skill/pdf-reader || {
   git checkout --theirs package-lock.json
   git add package-lock.json
   git merge --continue
@@ -37,75 +38,67 @@ git merge upstream/skill/pdf-reader || {
 ```
 
 This merges in:
-- `container/handlers/pdf-extract.js` (media handler for auto-extraction)
-- `container/skills/pdf-reader/pdf-reader` (CLI script)
 - `container/skills/pdf-reader/SKILL.md` (agent-facing documentation)
-- `poppler-utils` + CLI install in `container/Dockerfile`
+- `container/skills/pdf-reader/pdf-reader` (CLI script)
+- `poppler-utils` in `container/Dockerfile`
+- PDF attachment download in `src/channels/whatsapp.ts`
+- PDF tests in `src/channels/whatsapp.test.ts`
 
-No channel adapter changes — PDF download is handled by the core media pipeline (`src/media.ts`), which already saves `application/pdf` files for any channel.
+If the merge reports conflicts, resolve them by reading the conflicted files and understanding the intent of both sides.
 
-### Ask the user
-
-Use `AskUserQuestion` to ask:
-
-> The PDF reader is installed. By default, PDFs sent in chat are **auto-extracted to text** before reaching the agent.
->
-> Would you like to keep auto-extraction enabled? (yes/no)
->
-> - **Yes (default):** Agent receives extracted text from PDFs automatically.
-> - **No:** Agent receives the raw PDF via Claude's native document embedding. The `pdf-reader` CLI is still available for on-demand extraction.
-
-If the user chooses **No**, remove or rename the handler file:
-
-```bash
-mv container/handlers/pdf-extract.js container/handlers/pdf-extract.js.disabled
-```
-
-The agent can re-enable it later by renaming it back.
-
-### Build and restart
+### Validate
 
 ```bash
 npm run build
+npx vitest run src/channels/whatsapp.test.ts
+```
+
+### Rebuild container
+
+```bash
 ./container/build.sh
+```
+
+### Restart service
+
+```bash
 launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # macOS
 # Linux: systemctl --user restart nanoclaw
 ```
 
 ## Phase 3: Verify
 
-Tell the user:
+### Test PDF extraction
 
-> Send a PDF in any registered chat. The agent should respond with understanding of the PDF content.
+Send a PDF file in any registered WhatsApp chat. The agent should:
+1. Download the PDF to `attachments/`
+2. Respond acknowledging the PDF
+3. Be able to extract text when asked
 
-### Check logs
+### Test URL fetching
+
+Ask the agent to read a PDF from a URL. It should use `pdf-reader fetch <url>`.
+
+### Check logs if needed
 
 ```bash
 tail -f logs/nanoclaw.log | grep -i pdf
 ```
 
-With auto-extraction enabled, look for:
-- `[pdf-extract] pdftotext result: N chars` — extraction succeeded
-- `[pdf-extract] Returning text result` — handler delivered text to agent
-
-With auto-extraction disabled, look for:
-- `Embedded document:` — Claude received the PDF natively
-
-### Test CLI tool
-
-Ask the agent to read a PDF from a URL:
-
-> Use pdf-reader to fetch and read this PDF: [URL]
-
-The agent should use `pdf-reader fetch <url>`.
+Look for:
+- `Downloaded PDF attachment` — successful download
+- `Failed to download PDF attachment` — media download issue
 
 ## Troubleshooting
 
-**Agent says pdf-reader command not found**
-Container needs rebuilding. Run `./container/build.sh` and restart.
+### Agent says pdf-reader command not found
 
-**PDF text extraction is empty**
-The PDF may be scanned (image-based). `pdftotext` only handles text-based PDFs. The agent can use `agent-browser` to view it visually instead.
+Container needs rebuilding. Run `./container/build.sh` and restart the service.
 
-**Auto-extraction not working but CLI works**
-Check that `container/handlers/pdf-extract.js` exists (not `.disabled`). Handler files are synced to the container at spawn time.
+### PDF text extraction is empty
+
+The PDF may be scanned (image-based). pdftotext only handles text-based PDFs. Consider using the agent-browser to open the PDF visually instead.
+
+### WhatsApp PDF not detected
+
+Verify the message has `documentMessage` with `mimetype: application/pdf`. Some file-sharing apps send PDFs as generic files without the correct mimetype.

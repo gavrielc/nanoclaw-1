@@ -1,14 +1,10 @@
 /**
- * Default file handler — tries skill extractors, falls back to default.
+ * Default file handler — no skill extractors installed.
+ * Returns null to let the default fallback handle it.
  *
- * Skill implementations listed here:
- *   - pdf-extract: text extraction via pdftotext (poppler-utils)
+ * Skills can override this file on their branch to add extractors
+ * (e.g., pdf-extract for pdftotext extraction).
  */
-import { extractPdf } from './pdf-extract.js';
-
-export async function handleFile(filePath: string): Promise<any[] | null> {
-  const pdfResult = await extractPdf(filePath);
-  if (pdfResult) return pdfResult;
-
+export async function handleFile(_filePath: string): Promise<any[] | null> {
   return null;
 }
